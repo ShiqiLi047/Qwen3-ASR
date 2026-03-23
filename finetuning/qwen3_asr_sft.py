@@ -24,8 +24,8 @@ import librosa
 import torch
 from datasets import load_dataset
 from qwen_asr import Qwen3ASRModel
-from transformers import (GenerationConfig, Trainer, TrainerCallback,
-                          TrainingArguments)
+from transformers import (EarlyStoppingCallback, GenerationConfig, Trainer,
+                          TrainerCallback, TrainingArguments)
 
 
 def patch_outer_forward(model):
@@ -214,6 +214,8 @@ def parse_args():
 
     # Train hyper-params
     p.add_argument("--batch_size", type=int, default=32)
+    p.add_argument("--eval_batch_size", type=int, default=0,
+                   help="Eval batch size. 0=same as batch_size.")
     p.add_argument("--grad_acc", type=int, default=4)
     p.add_argument("--lr", type=float, default=2e-5)
     p.add_argument("--epochs", type=float, default=1)
@@ -232,6 +234,21 @@ def parse_args():
     p.add_argument("--save_steps", type=int, default=200)
     p.add_argument("--save_total_limit", type=int, default=5)
 
+    # Early stopping
+    p.add_argument("--early_stopping_patience", type=int, default=0,
+                   help="Stop after N evals with no improvement. 0=disabled.")
+    p.add_argument("--early_stopping_threshold", type=float, default=0.0,
+                   help="Minimum change to qualify as an improvement.")
+
+    # Gradient checkpointing
+    p.add_argument("--gradient_checkpointing", type=int, default=0,
+                   help="1=enable gradient checkpointing to save VRAM.")
+
+    # Best model
+    p.add_argument("--load_best_model_at_end", type=int, default=0,
+                   help="1=load best model at end (requires eval).")
+    p.add_argument("--metric_for_best_model", type=str, default="eval_loss")
+
     # Resume
     p.add_argument("--resume_from", type=str, default="")
     p.add_argument("--resume", type=int, default=0)
@@ -246,10 +263,21 @@ def main():
         raise ValueError("TRAIN_FILE is required (json/jsonl). Needs fields: audio, text, optional prompt")
 
     use_bf16 = torch.cuda.is_available() and torch.cuda.get_device_capability(0)[0] >= 8
+
+    # Detect flash-attn availability
+    try:
+        import flash_attn  # noqa: F401
+        attn_impl = "flash_attention_2"
+        print("[info] FlashAttention 2 detected, enabling it")
+    except ImportError:
+        attn_impl = None
+        print("[info] FlashAttention 2 not found, using default attention")
+
     asr_wrapper = Qwen3ASRModel.from_pretrained(
         args_cli.model_path,
         dtype=torch.bfloat16 if use_bf16 else torch.float16,
         device_map=None,
+        **({"attn_implementation": attn_impl} if attn_impl else {}),
     )
     model = asr_wrapper.model
     processor = asr_wrapper.processor
@@ -277,7 +305,9 @@ def main():
     training_args = TrainingArguments(
         output_dir=args_cli.output_dir,
         per_device_train_batch_size=args_cli.batch_size,
+        per_device_eval_batch_size=args_cli.eval_batch_size if args_cli.eval_batch_size > 0 else args_cli.batch_size,
         gradient_accumulation_steps=args_cli.grad_acc,
+        gradient_checkpointing=bool(args_cli.gradient_checkpointing),
         learning_rate=args_cli.lr,
         num_train_epochs=args_cli.epochs,
         logging_steps=args_cli.log_steps,
@@ -294,12 +324,22 @@ def main():
         eval_strategy="steps" if args_cli.eval_file else "no",
         eval_steps=args_cli.save_steps if args_cli.eval_file else None,
         do_eval=bool(args_cli.eval_file),
+        load_best_model_at_end=bool(args_cli.load_best_model_at_end) and bool(args_cli.eval_file),
+        metric_for_best_model=args_cli.metric_for_best_model,
+        greater_is_better=False,
         bf16=use_bf16,
         fp16=not use_bf16,
         ddp_find_unused_parameters=False,
         remove_unused_columns=False,
         report_to="none",
     )
+
+    callbacks = [MakeEveryCheckpointInferableCallback(base_model_path=args_cli.model_path)]
+    if args_cli.early_stopping_patience > 0 and args_cli.eval_file:
+        callbacks.append(EarlyStoppingCallback(
+            early_stopping_patience=args_cli.early_stopping_patience,
+            early_stopping_threshold=args_cli.early_stopping_threshold,
+        ))
 
     trainer = CastFloatInputsTrainer(
         model=model,
@@ -308,7 +348,7 @@ def main():
         eval_dataset=ds.get("validation", None),
         data_collator=collator,
         tokenizer=processor.tokenizer,
-        callbacks=[MakeEveryCheckpointInferableCallback(base_model_path=args_cli.model_path)],
+        callbacks=callbacks,
     )
 
     resume_from = (args_cli.resume_from or "").strip()
